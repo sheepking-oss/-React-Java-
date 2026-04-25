@@ -12,8 +12,11 @@ import com.campus.secondhand.entity.User;
 import com.campus.secondhand.mapper.ExchangeMapper;
 import com.campus.secondhand.mapper.ProductMapper;
 import com.campus.secondhand.mapper.UserMapper;
+import com.campus.secondhand.service.DistributedLockService;
 import com.campus.secondhand.service.ExchangeService;
 import com.campus.secondhand.utils.UserContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -23,15 +26,23 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 @Service
 public class ExchangeServiceImpl extends ServiceImpl<ExchangeMapper, Exchange> implements ExchangeService {
+
+    private static final Logger logger = LoggerFactory.getLogger(ExchangeServiceImpl.class);
+
+    private static final int LOCK_EXPIRE_SECONDS = 3600;
 
     @Autowired
     private ProductMapper productMapper;
 
     @Autowired
     private UserMapper userMapper;
+
+    @Autowired
+    private DistributedLockService distributedLockService;
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -45,41 +56,89 @@ public class ExchangeServiceImpl extends ServiceImpl<ExchangeMapper, Exchange> i
             throw new RuntimeException("不能与自己换物");
         }
 
-        Product targetProduct = productMapper.selectById(dto.getTargetProductId());
-        if (targetProduct == null) {
-            throw new RuntimeException("目标商品不存在");
-        }
+        Long targetProductId = dto.getTargetProductId();
+        String lockKey = DistributedLockServiceImpl.getExchangeLockKey(targetProductId);
 
-        if (!targetProduct.getUserId().equals(dto.getTargetId())) {
-            throw new RuntimeException("目标商品不属于目标用户");
-        }
-
-        if (targetProduct.getStatus() != 1) {
-            throw new RuntimeException("目标商品已下架或已售出");
-        }
-
-        if (dto.getInitiatorProductId() != null) {
-            Product initiatorProduct = productMapper.selectById(dto.getInitiatorProductId());
-            if (initiatorProduct == null) {
-                throw new RuntimeException("发起商品不存在");
+        distributedLockService.executeWithLock(lockKey, 2, 60, TimeUnit.SECONDS, () -> {
+            Product targetProduct = productMapper.selectById(targetProductId);
+            if (targetProduct == null) {
+                throw new RuntimeException("目标商品不存在");
             }
-            if (!initiatorProduct.getUserId().equals(userId)) {
-                throw new RuntimeException("发起商品不属于您");
+
+            if (!targetProduct.getUserId().equals(dto.getTargetId())) {
+                throw new RuntimeException("目标商品不属于目标用户");
             }
-            if (initiatorProduct.getStatus() != 1) {
-                throw new RuntimeException("发起商品已下架或已售出");
+
+            validateProductForExchange(targetProduct, "目标商品");
+
+            if (dto.getInitiatorProductId() != null) {
+                Product initiatorProduct = productMapper.selectById(dto.getInitiatorProductId());
+                if (initiatorProduct == null) {
+                    throw new RuntimeException("发起商品不存在");
+                }
+                if (!initiatorProduct.getUserId().equals(userId)) {
+                    throw new RuntimeException("发起商品不属于您");
+                }
+                validateProductForExchange(initiatorProduct, "发起商品");
             }
+
+            Exchange exchange = new Exchange();
+            exchange.setInitiatorId(userId);
+            exchange.setTargetId(dto.getTargetId());
+            exchange.setInitiatorProductId(dto.getInitiatorProductId());
+            exchange.setTargetProductId(targetProductId);
+            exchange.setInitiatorDescription(dto.getInitiatorDescription());
+            exchange.setStatus("PENDING");
+
+            this.save(exchange);
+
+            lockProductForExchange(targetProduct, exchange.getId(), userId);
+
+            logger.info("换物申请创建成功, exchangeId: {}, targetProductId: {}, initiatorId: {}", 
+                exchange.getId(), targetProductId, userId);
+
+            return null;
+        });
+    }
+
+    private void validateProductForExchange(Product product, String productName) {
+        if (product.getStatus() == null) {
+            throw new RuntimeException(productName + "状态异常");
         }
 
-        Exchange exchange = new Exchange();
-        exchange.setInitiatorId(userId);
-        exchange.setTargetId(dto.getTargetId());
-        exchange.setInitiatorProductId(dto.getInitiatorProductId());
-        exchange.setTargetProductId(dto.getTargetProductId());
-        exchange.setInitiatorDescription(dto.getInitiatorDescription());
-        exchange.setStatus("PENDING");
+        if (product.getStatus() == Product.STATUS_LOCKED) {
+            throw new RuntimeException(productName + "正在换物申请处理中，请稍后再试");
+        }
 
-        this.save(exchange);
+        if (product.getStatus() == Product.STATUS_IN_EXCHANGE) {
+            throw new RuntimeException(productName + "已进入换物流程");
+        }
+
+        if (product.getStatus() == Product.STATUS_SOLD) {
+            throw new RuntimeException(productName + "已售出");
+        }
+
+        if (product.getStatus() == Product.STATUS_OFF_SHELF) {
+            throw new RuntimeException(productName + "已下架");
+        }
+
+        if (product.getStatus() != Product.STATUS_AVAILABLE) {
+            throw new RuntimeException(productName + "状态异常");
+        }
+
+        if (product.getAuditStatus() != 1) {
+            throw new RuntimeException(productName + "未通过审核");
+        }
+    }
+
+    private void lockProductForExchange(Product product, Long exchangeId, Long initiatorId) {
+        product.setStatus(Product.STATUS_LOCKED);
+        product.setLockExpireTime(System.currentTimeMillis() / 1000 + LOCK_EXPIRE_SECONDS);
+        product.setLockHolderId(exchangeId);
+        productMapper.updateById(product);
+        
+        logger.info("商品已锁定，等待换物确认, productId: {}, exchangeId: {}, initiatorId: {}", 
+            product.getId(), exchangeId, initiatorId);
     }
 
     @Override
@@ -174,10 +233,22 @@ public class ExchangeServiceImpl extends ServiceImpl<ExchangeMapper, Exchange> i
             throw new RuntimeException("换物申请状态不允许操作");
         }
 
-        exchange.setStatus("ACCEPTED");
-        exchange.setHandleTime(LocalDateTime.now());
+        String lockKey = DistributedLockServiceImpl.getExchangeLockKey(exchange.getTargetProductId());
+        distributedLockService.executeWithLock(lockKey, 2, 60, TimeUnit.SECONDS, () -> {
+            Product targetProduct = productMapper.selectById(exchange.getTargetProductId());
+            if (targetProduct != null && targetProduct.getStatus() == Product.STATUS_LOCKED) {
+                targetProduct.setStatus(Product.STATUS_IN_EXCHANGE);
+                productMapper.updateById(targetProduct);
+                logger.info("换物申请已接受，商品进入换物流程, productId: {}, exchangeId: {}", 
+                    exchange.getTargetProductId(), id);
+            }
 
-        this.updateById(exchange);
+            exchange.setStatus("ACCEPTED");
+            exchange.setHandleTime(LocalDateTime.now());
+            this.updateById(exchange);
+
+            return null;
+        });
     }
 
     @Override
@@ -201,11 +272,17 @@ public class ExchangeServiceImpl extends ServiceImpl<ExchangeMapper, Exchange> i
             throw new RuntimeException("换物申请状态不允许操作");
         }
 
-        exchange.setStatus("REJECTED");
-        exchange.setHandleTime(LocalDateTime.now());
-        exchange.setRejectReason(reason);
+        String lockKey = DistributedLockServiceImpl.getExchangeLockKey(exchange.getTargetProductId());
+        distributedLockService.executeWithLock(lockKey, 2, 60, TimeUnit.SECONDS, () -> {
+            unlockProduct(exchange.getTargetProductId(), exchange.getId());
 
-        this.updateById(exchange);
+            exchange.setStatus("REJECTED");
+            exchange.setHandleTime(LocalDateTime.now());
+            exchange.setRejectReason(reason);
+            this.updateById(exchange);
+
+            return null;
+        });
     }
 
     @Override
@@ -229,10 +306,28 @@ public class ExchangeServiceImpl extends ServiceImpl<ExchangeMapper, Exchange> i
             throw new RuntimeException("换物申请状态不允许取消");
         }
 
-        exchange.setStatus("CANCELLED");
-        exchange.setHandleTime(LocalDateTime.now());
+        String lockKey = DistributedLockServiceImpl.getExchangeLockKey(exchange.getTargetProductId());
+        distributedLockService.executeWithLock(lockKey, 2, 60, TimeUnit.SECONDS, () -> {
+            unlockProduct(exchange.getTargetProductId(), exchange.getId());
 
-        this.updateById(exchange);
+            exchange.setStatus("CANCELLED");
+            exchange.setHandleTime(LocalDateTime.now());
+            this.updateById(exchange);
+
+            return null;
+        });
+    }
+
+    private void unlockProduct(Long productId, Long exchangeId) {
+        Product product = productMapper.selectById(productId);
+        if (product != null && product.getStatus() == Product.STATUS_LOCKED
+                && exchangeId.equals(product.getLockHolderId())) {
+            product.setStatus(Product.STATUS_AVAILABLE);
+            product.setLockExpireTime(null);
+            product.setLockHolderId(null);
+            productMapper.updateById(product);
+            logger.info("商品已解锁, productId: {}, exchangeId: {}", productId, exchangeId);
+        }
     }
 
     private Map<String, Object> buildExchangeDetail(Exchange exchange) {

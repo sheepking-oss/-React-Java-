@@ -12,6 +12,12 @@ import java.time.LocalDateTime;
 public class Product implements Serializable {
     private static final long serialVersionUID = 1L;
 
+    public static final int STATUS_AVAILABLE = 1;
+    public static final int STATUS_SOLD = 2;
+    public static final int STATUS_OFF_SHELF = 0;
+    public static final int STATUS_LOCKED = 3;
+    public static final int STATUS_IN_EXCHANGE = 4;
+
     @TableId(type = IdType.AUTO)
     private Long id;
 
@@ -47,6 +53,13 @@ public class Product implements Serializable {
 
     private String auditReason;
 
+    @Version
+    private Integer version;
+
+    private Long lockExpireTime;
+
+    private Long lockHolderId;
+
     @TableLogic
     private Integer deleted;
 
@@ -55,4 +68,20 @@ public class Product implements Serializable {
 
     @TableField(fill = FieldFill.INSERT_UPDATE)
     private LocalDateTime updateTime;
+
+    public boolean isAvailableForTrade() {
+        return this.status != null && this.status == STATUS_AVAILABLE;
+    }
+
+    public boolean isLocked() {
+        return this.status != null && (this.status == STATUS_LOCKED || this.status == STATUS_IN_EXCHANGE);
+    }
+
+    public boolean isSold() {
+        return this.status != null && this.status == STATUS_SOLD;
+    }
+
+    public boolean isOffShelf() {
+        return this.status != null && this.status == STATUS_OFF_SHELF;
+    }
 }

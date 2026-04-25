@@ -13,8 +13,11 @@ import com.campus.secondhand.entity.User;
 import com.campus.secondhand.mapper.OrderMapper;
 import com.campus.secondhand.mapper.ProductMapper;
 import com.campus.secondhand.mapper.UserMapper;
+import com.campus.secondhand.service.DistributedLockService;
 import com.campus.secondhand.service.OrderService;
 import com.campus.secondhand.utils.UserContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,15 +27,21 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 @Service
 public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements OrderService {
+
+    private static final Logger logger = LoggerFactory.getLogger(OrderServiceImpl.class);
 
     @Autowired
     private ProductMapper productMapper;
 
     @Autowired
     private UserMapper userMapper;
+
+    @Autowired
+    private DistributedLockService distributedLockService;
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -42,13 +51,45 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
             throw new RuntimeException("用户未登录");
         }
 
-        Product product = productMapper.selectById(dto.getProductId());
-        if (product == null) {
-            throw new RuntimeException("商品不存在");
-        }
+        Long productId = dto.getProductId();
+        String lockKey = DistributedLockServiceImpl.getProductLockKey(productId);
 
-        if (product.getStatus() != 1) {
-            throw new RuntimeException("商品已下架或已售出");
+        return distributedLockService.executeWithLock(lockKey, 2, 60, TimeUnit.SECONDS, () -> {
+            Product product = productMapper.selectById(productId);
+            if (product == null) {
+                throw new RuntimeException("商品不存在");
+            }
+
+            validateProductStatus(product, userId);
+
+            if (product.getStatus() != Product.STATUS_AVAILABLE) {
+                String errorMsg = getStatusErrorMessage(product.getStatus());
+                throw new RuntimeException(errorMsg);
+            }
+
+            Order order = new Order();
+            order.setOrderNo("SH" + IdUtil.getSnowflakeNextIdStr());
+            order.setProductId(dto.getProductId());
+            order.setSellerId(product.getUserId());
+            order.setBuyerId(userId);
+            order.setPrice(product.getPrice());
+            order.setStatus("PENDING");
+            order.setBuyerAddress(dto.getBuyerAddress());
+            order.setBuyerPhone(dto.getBuyerPhone());
+            order.setBuyerName(dto.getBuyerName());
+
+            this.save(order);
+
+            logger.info("订单创建成功, orderNo: {}, productId: {}, userId: {}", 
+                order.getOrderNo(), productId, userId);
+
+            return order.getOrderNo();
+        });
+    }
+
+    private void validateProductStatus(Product product, Long userId) {
+        if (product.getStatus() == null) {
+            throw new RuntimeException("商品状态异常");
         }
 
         if (product.getAuditStatus() != 1) {
@@ -59,20 +100,39 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
             throw new RuntimeException("不能购买自己发布的商品");
         }
 
-        Order order = new Order();
-        order.setOrderNo("SH" + IdUtil.getSnowflakeNextIdStr());
-        order.setProductId(dto.getProductId());
-        order.setSellerId(product.getUserId());
-        order.setBuyerId(userId);
-        order.setPrice(product.getPrice());
-        order.setStatus("PENDING");
-        order.setBuyerAddress(dto.getBuyerAddress());
-        order.setBuyerPhone(dto.getBuyerPhone());
-        order.setBuyerName(dto.getBuyerName());
+        if (product.getStatus() == Product.STATUS_LOCKED) {
+            throw new RuntimeException("商品正在换物申请处理中，请稍后再试");
+        }
 
-        this.save(order);
+        if (product.getStatus() == Product.STATUS_IN_EXCHANGE) {
+            throw new RuntimeException("商品已进入换物流程，无法购买");
+        }
 
-        return order.getOrderNo();
+        if (product.getStatus() == Product.STATUS_SOLD) {
+            throw new RuntimeException("商品已售出");
+        }
+
+        if (product.getStatus() == Product.STATUS_OFF_SHELF) {
+            throw new RuntimeException("商品已下架");
+        }
+    }
+
+    private String getStatusErrorMessage(Integer status) {
+        if (status == null) {
+            return "商品状态异常";
+        }
+        switch (status) {
+            case Product.STATUS_LOCKED:
+                return "商品正在换物申请处理中，请稍后再试";
+            case Product.STATUS_IN_EXCHANGE:
+                return "商品已进入换物流程，无法购买";
+            case Product.STATUS_SOLD:
+                return "商品已售出";
+            case Product.STATUS_OFF_SHELF:
+                return "商品已下架";
+            default:
+                return "商品状态异常";
+        }
     }
 
     @Override
@@ -268,8 +328,10 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
 
         Product product = productMapper.selectById(order.getProductId());
         if (product != null) {
-            product.setStatus(2);
+            product.setStatus(Product.STATUS_SOLD);
             productMapper.updateById(product);
+            logger.info("订单已完成，商品标记为已售出, productId: {}, orderNo: {}", 
+                order.getProductId(), orderNo);
         }
 
         User buyer = userMapper.selectById(order.getBuyerId());
@@ -317,8 +379,10 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
 
         Product product = productMapper.selectById(order.getProductId());
         if (product != null) {
-            product.setStatus(2);
+            product.setStatus(Product.STATUS_SOLD);
             productMapper.updateById(product);
+            logger.info("订单已完成，商品标记为已售出, productId: {}, orderNo: {}", 
+                order.getProductId(), orderNo);
         }
     }
 

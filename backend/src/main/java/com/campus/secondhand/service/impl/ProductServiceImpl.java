@@ -1,6 +1,8 @@
 package com.campus.secondhand.service.impl;
 
+import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.crypto.digest.DigestUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
@@ -14,18 +16,26 @@ import com.campus.secondhand.mapper.ProductMapper;
 import com.campus.secondhand.mapper.UserMapper;
 import com.campus.secondhand.service.ProductService;
 import com.campus.secondhand.utils.UserContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 @Service
 public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> implements ProductService {
+
+    private static final Logger logger = LoggerFactory.getLogger(ProductServiceImpl.class);
 
     @Autowired
     private ProductImageMapper productImageMapper;
@@ -33,10 +43,17 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
     @Autowired
     private UserMapper userMapper;
 
+    @Autowired(required = false)
+    private RedisTemplate<String, Object> redisTemplate;
+
     private static final List<String> DEFAULT_CATEGORIES = Arrays.asList(
             "数码产品", "书籍教材", "生活用品", "服饰鞋包",
             "运动器材", "乐器配件", "美妆护肤", "其他"
     );
+
+    private static final String CONTENT_HASH_KEY_PREFIX = "product:content:hash:";
+
+    private static final long CONTENT_HASH_EXPIRE_SECONDS = 300;
 
     @Override
     public PageResult<Map<String, Object>> getProductList(String keyword, String category, Integer status, Long userId, Integer current, Integer size) {
@@ -163,6 +180,9 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
             throw new RuntimeException("用户未登录");
         }
 
+        String contentHash = generateContentHash(userId, dto);
+        checkDuplicateByContentHash(userId, contentHash, "publish");
+
         Product product = new Product();
         product.setUserId(userId);
         product.setTitle(dto.getTitle());
@@ -183,6 +203,50 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product> impl
         this.save(product);
 
         saveProductImages(product.getId(), dto.getImages());
+    }
+
+    private String generateContentHash(Long userId, ProductDTO dto) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(userId).append(":");
+        sb.append(dto.getTitle()).append(":");
+        sb.append(dto.getDescription()).append(":");
+        sb.append(dto.getPrice()).append(":");
+        sb.append(dto.getCategory()).append(":");
+        sb.append(dto.getCondition()).append(":");
+        sb.append(dto.getIsNegotiable()).append(":");
+
+        if (CollUtil.isNotEmpty(dto.getImages())) {
+            sb.append(String.join(",", dto.getImages()));
+        }
+
+        String hash = DigestUtil.md5Hex(sb.toString());
+        logger.info("生成商品内容哈希, userId: {}, hash: {}", userId, hash);
+        return hash;
+    }
+
+    private void checkDuplicateByContentHash(Long userId, String contentHash, String action) {
+        if (redisTemplate == null) {
+            logger.warn("Redis 未配置，跳过内容哈希校验");
+            return;
+        }
+
+        String key = CONTENT_HASH_KEY_PREFIX + userId + ":" + contentHash;
+
+        try {
+            Boolean exists = redisTemplate.hasKey(key);
+            if (Boolean.TRUE.equals(exists)) {
+                logger.warn("检测到重复提交，userId: {}, action: {}, hash: {}", userId, action, contentHash);
+                throw new RuntimeException("请勿重复提交，请稍后再试");
+            }
+
+            redisTemplate.opsForValue().set(key, LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME),
+                    CONTENT_HASH_EXPIRE_SECONDS, TimeUnit.SECONDS);
+            logger.info("保存内容哈希，key: {}, expireSeconds: {}", key, CONTENT_HASH_EXPIRE_SECONDS);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            logger.error("内容哈希校验异常: {}", e.getMessage(), e);
+        }
     }
 
     @Override
