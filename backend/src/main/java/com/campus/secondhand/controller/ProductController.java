@@ -1,5 +1,6 @@
 package com.campus.secondhand.controller;
 
+import com.campus.secondhand.annotation.Idempotent;
 import com.campus.secondhand.common.PageResult;
 import com.campus.secondhand.common.Result;
 import com.campus.secondhand.dto.ProductDTO;
@@ -42,12 +43,14 @@ public class ProductController {
         return Result.success(categories);
     }
 
+    @Idempotent(action = "product:publish", expireSeconds = 120)
     @PostMapping("/publish")
     public Result<Void> publish(@Validated @RequestBody ProductDTO dto) {
         productService.publishProduct(dto);
         return Result.success();
     }
 
+    @Idempotent(action = "product:update", expireSeconds = 120)
     @PutMapping("/update")
     public Result<Void> update(@Validated @RequestBody ProductDTO dto) {
         productService.updateProduct(dto);
