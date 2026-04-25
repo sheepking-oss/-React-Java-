@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
 import {
   Form,
   Input,
@@ -18,9 +18,14 @@ import {
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons'
 import { useNavigate, useParams } from 'react-router-dom'
 import { publishProduct, updateProduct, getCategories, getProductDetail, uploadImage } from '../api/product'
+import request from '../utils/request'
 
 const { TextArea } = Input
 const { Option } = Select
+
+const generateRequestId = () => {
+  return 'req_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9)
+}
 
 const PublishProduct = () => {
   const navigate = useNavigate()
@@ -29,6 +34,7 @@ const PublishProduct = () => {
   const [loading, setLoading] = useState(false)
   const [categories, setCategories] = useState([])
   const [fileList, setFileList] = useState([])
+  const [requestId, setRequestId] = useState(generateRequestId())
 
   useEffect(() => {
     fetchCategories()
@@ -101,7 +107,12 @@ const PublishProduct = () => {
     },
   }
 
-  const handleSubmit = async (values) => {
+  const handleSubmit = useCallback(async (values) => {
+    if (loading) {
+      message.warning('请求处理中，请稍后再试')
+      return
+    }
+
     setLoading(true)
     try {
       const images = fileList
@@ -114,21 +125,35 @@ const PublishProduct = () => {
         coverImage: images[0] || '',
       }
 
+      const currentRequestId = requestId
+
       if (id) {
         data.id = parseInt(id)
-        await updateProduct(data)
+        await request.post('/product/update', data, {
+          headers: {
+            'X-Request-Id': currentRequestId,
+          },
+        })
         message.success('商品更新成功')
       } else {
-        await publishProduct(data)
+        await request.post('/product/publish', data, {
+          headers: {
+            'X-Request-Id': currentRequestId,
+          },
+        })
         message.success('商品发布成功')
       }
+
+      setRequestId(generateRequestId())
+
       navigate('/my-products')
     } catch (error) {
       console.error('发布商品失败', error)
+      setRequestId(generateRequestId())
     } finally {
       setLoading(false)
     }
-  }
+  }, [loading, fileList, requestId, id])
 
   const conditionOptions = [
     { label: '全新', value: '全新' },
